@@ -32,14 +32,13 @@ jobs:
           const branch = process.env.GITHUB_REF_NAME;
           const sha = process.env.GITHUB_SHA;
           const commitUrl = `https://github.com/${repo}/commit/${sha}`;
+          const repoUrl = `https://github.com/${repo}`;
 
           const head = evt.head_commit || {};
           const rawMsg = (head.message || '').replace(/\r\n/g, '\n').trim();
           const [subjectLine, ...restLines] = rawMsg.split('\n');
           const subject = (subjectLine || '').trim();
           const body = restLines.join('\n').trim();
-
-          const rootTextDesired = `Push made to \`${repo}\`: \`${subject || '(no message)'}\`\n\n${commitUrl}`;
 
           const agent = new BskyAgent({ service: 'https://bsky.social' });
           const MAX = 300;
@@ -81,19 +80,17 @@ jobs:
                 password: process.env.BSKY_APP_PASSWORD,
               });
 
-              // Make sure the root fits (keeping the URL visible).
-              let rootText = rootTextDesired;
+              let rootText = `Push made to \`${repo}\`: \`${subject || '(no message)'}\``;
               let rt = new RichText({ text: rootText });
               await rt.detectFacets(agent);
               if (rt.graphemeLength > MAX) {
                 const prefix = `Push made to \`${repo}\`: \``;
-                const suffix = `\`\n\n${commitUrl}`;
+                const suffix = '`';
                 const room = MAX - (prefix.length + suffix.length) - 1;
                 const trimmed = (subject || '(no message)').slice(0, Math.max(room, 0)) + '…';
                 rootText = `${prefix}${trimmed}${suffix}`;
               }
 
-              // Root post with website card embed for the commit URL
               const rootRes = await agent.post({
                 $type: 'app.bsky.feed.post',
                 text: rootText,
@@ -103,18 +100,34 @@ jobs:
                     uri: commitUrl,
                     title: `Commit on ${repo}@${branch}`,
                     description: subject || '(no message)'
-                    // thumb optional; omit to let clients render their own preview
                   }
                 },
                 createdAt: new Date().toISOString(),
               });
               console.log('Root post:', rootRes.data.uri);
 
-              // Thread the commit body, if present
+              const repoCard = await agent.post({
+                $type: 'app.bsky.feed.post',
+                text: `Repository: ${repo}`,
+                embed: {
+                  $type: 'app.bsky.embed.external',
+                  external: {
+                    uri: repoUrl,
+                    title: `Repository: ${repo}`,
+                    description: `GitHub repository for ${repo}`
+                  }
+                },
+                reply: {
+                  root: { uri: rootRes.data.uri, cid: rootRes.data.cid },
+                  parent: { uri: rootRes.data.uri, cid: rootRes.data.cid },
+                },
+                createdAt: new Date().toISOString(),
+              });
+              console.log('Repo card reply:', repoCard.data.uri);
+
               if (body) {
-                const threadIntro = `Commit message:\n${body}`;
-                const chunks = await chunkText(threadIntro);
-                let parent = rootRes;
+                const chunks = await chunkText(`Commit message:\n${body}`);
+                let parent = repoCard;
                 for (const chunk of chunks) {
                   const res = await agent.post({
                     $type: 'app.bsky.feed.post',
@@ -125,7 +138,7 @@ jobs:
                     },
                     createdAt: new Date().toISOString(),
                   });
-                  console.log('Reply post:', res.data.uri);
+                  console.log('Commit body reply:', res.data.uri);
                   parent = res;
                 }
               }
