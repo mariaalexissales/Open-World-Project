@@ -28,20 +28,19 @@ jobs:
           const { BskyAgent, RichText } = require('@atproto/api');
 
           const evt = require(process.env.GITHUB_EVENT_PATH);
-          const repo = process.env.GITHUB_REPOSITORY;   // owner/repo
+          const repo = process.env.GITHUB_REPOSITORY;
           const branch = process.env.GITHUB_REF_NAME;
           const sha = process.env.GITHUB_SHA;
-          const url = `https://github.com/${repo}/commit/${sha}`;
+          const commitUrl = `https://github.com/${repo}/commit/${sha}`;
 
           const head = evt.head_commit || {};
-          const author = (head.author && head.author.name) || process.env.GITHUB_ACTOR || 'Someone';
           const rawMsg = (head.message || '').replace(/\r\n/g, '\n').trim();
-
           const [subjectLine, ...restLines] = rawMsg.split('\n');
           const subject = (subjectLine || '').trim();
           const body = restLines.join('\n').trim();
 
-          const rootDesired = `Push made to \`${repo}\`: \`${subject || '(no message)'}\`\n\n${url}`;
+          const rootTextDesired = `Push made to \`${repo}\`: \`${subject || '(no message)'}\`\n\n${commitUrl}`;
+
           const agent = new BskyAgent({ service: 'https://bsky.social' });
           const MAX = 300;
 
@@ -57,7 +56,6 @@ jobs:
                 current = candidate;
               } else {
                 if (current) chunks.push(current);
-                // token alone too long? hard-split
                 const rtWord = new RichText({ text: token });
                 await rtWord.detectFacets(agent);
                 if (rtWord.graphemeLength > MAX) {
@@ -83,37 +81,39 @@ jobs:
                 password: process.env.BSKY_APP_PASSWORD,
               });
 
-              // Ensure root fits; if not, trim subject and push full message to thread.
-              let rootText = rootDesired;
-              let needsFullInThread = false;
-
+              // Make sure the root fits (keeping the URL visible).
+              let rootText = rootTextDesired;
               let rt = new RichText({ text: rootText });
               await rt.detectFacets(agent);
               if (rt.graphemeLength > MAX) {
                 const prefix = `Push made to \`${repo}\`: \``;
-                const suffix = `\`\n\n${url}`;
-                const room = MAX - (prefix.length + suffix.length) - 1; // space for ellipsis
+                const suffix = `\`\n\n${commitUrl}`;
+                const room = MAX - (prefix.length + suffix.length) - 1;
                 const trimmed = (subject || '(no message)').slice(0, Math.max(room, 0)) + '…';
                 rootText = `${prefix}${trimmed}${suffix}`;
-                needsFullInThread = true;
               }
 
+              // Root post with website card embed for the commit URL
               const rootRes = await agent.post({
                 $type: 'app.bsky.feed.post',
                 text: rootText,
+                embed: {
+                  $type: 'app.bsky.embed.external',
+                  external: {
+                    uri: commitUrl,
+                    title: `Commit on ${repo}@${branch}`,
+                    description: subject || '(no message)'
+                    // thumb optional; omit to let clients render their own preview
+                  }
+                },
                 createdAt: new Date().toISOString(),
               });
               console.log('Root post:', rootRes.data.uri);
 
-              let threadText = '';
-              if (needsFullInThread) {
-                threadText = `Full message:\n${rawMsg || '(no message)'}`;
-              } else if (body) {
-                threadText = `Commit message:\n${body}`;
-              }
-
-              if (threadText) {
-                const chunks = await chunkText(threadText);
+              // Thread the commit body, if present
+              if (body) {
+                const threadIntro = `Commit message:\n${body}`;
+                const chunks = await chunkText(threadIntro);
                 let parent = rootRes;
                 for (const chunk of chunks) {
                   const res = await agent.post({
