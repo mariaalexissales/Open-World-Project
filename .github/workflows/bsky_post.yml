@@ -1,8 +1,8 @@
-name: Post commit to Bluesky
+name: Post Commit to Bsky
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
 
 jobs:
   bsky:
@@ -26,37 +26,109 @@ jobs:
         run: |
           node - <<'NODE'
           const { BskyAgent, RichText } = require('@atproto/api');
+
           const evt = require(process.env.GITHUB_EVENT_PATH);
-          const repo = process.env.GITHUB_REPOSITORY;
+          const repo = process.env.GITHUB_REPOSITORY;   // owner/repo
           const branch = process.env.GITHUB_REF_NAME;
           const sha = process.env.GITHUB_SHA;
-          const short = (sha || '').slice(0,7);
           const url = `https://github.com/${repo}/commit/${sha}`;
+
           const head = evt.head_commit || {};
           const author = (head.author && head.author.name) || process.env.GITHUB_ACTOR || 'Someone';
-          const msg = (head.message || '').replace(/\s+/g, ' ').trim();
-          let text = `${author} pushed to ${repo}@${branch} (${short}): ${msg}\n${url}`;
-          const rt = new RichText({ text });
+          const rawMsg = (head.message || '').replace(/\r\n/g, '\n').trim();
+
+          const [subjectLine, ...restLines] = rawMsg.split('\n');
+          const subject = (subjectLine || '').trim();
+          const body = restLines.join('\n').trim();
+
+          const rootDesired = `Push made to \`${repo}\`: \`${subject || '(no message)'}\`\n\n${url}`;
           const agent = new BskyAgent({ service: 'https://bsky.social' });
+          const MAX = 300;
+
+          async function chunkText(text) {
+            if (!text) return [];
+            const chunks = [];
+            let current = '';
+            for (const token of text.split(' ')) {
+              const candidate = current ? current + ' ' + token : token;
+              const rt = new RichText({ text: candidate });
+              await rt.detectFacets(agent);
+              if (rt.graphemeLength <= MAX) {
+                current = candidate;
+              } else {
+                if (current) chunks.push(current);
+                // token alone too long? hard-split
+                const rtWord = new RichText({ text: token });
+                await rtWord.detectFacets(agent);
+                if (rtWord.graphemeLength > MAX) {
+                  let s = token;
+                  while (s.length) {
+                    chunks.push(s.slice(0, MAX));
+                    s = s.slice(MAX);
+                  }
+                  current = '';
+                } else {
+                  current = token;
+                }
+              }
+            }
+            if (current) chunks.push(current);
+            return chunks;
+          }
+
           (async () => {
             try {
               await agent.login({
                 identifier: process.env.BSKY_HANDLE,
                 password: process.env.BSKY_APP_PASSWORD,
               });
+
+              // Ensure root fits; if not, trim subject and push full message to thread.
+              let rootText = rootDesired;
+              let needsFullInThread = false;
+
+              let rt = new RichText({ text: rootText });
               await rt.detectFacets(agent);
-              const MAX = 300;
               if (rt.graphemeLength > MAX) {
-                const keepUrl = `\n${url}`;
-                const available = MAX - keepUrl.length - 1;
-                text = text.slice(0, Math.max(available, 0)) + '…' + keepUrl;
+                const prefix = `Push made to \`${repo}\`: \``;
+                const suffix = `\`\n\n${url}`;
+                const room = MAX - (prefix.length + suffix.length) - 1; // space for ellipsis
+                const trimmed = (subject || '(no message)').slice(0, Math.max(room, 0)) + '…';
+                rootText = `${prefix}${trimmed}${suffix}`;
+                needsFullInThread = true;
               }
-              const res = await agent.post({
+
+              const rootRes = await agent.post({
                 $type: 'app.bsky.feed.post',
-                text,
+                text: rootText,
                 createdAt: new Date().toISOString(),
               });
-              console.log('Bluesky post OK:', res.data.uri);
+              console.log('Root post:', rootRes.data.uri);
+
+              let threadText = '';
+              if (needsFullInThread) {
+                threadText = `Full message:\n${rawMsg || '(no message)'}`;
+              } else if (body) {
+                threadText = `Commit message:\n${body}`;
+              }
+
+              if (threadText) {
+                const chunks = await chunkText(threadText);
+                let parent = rootRes;
+                for (const chunk of chunks) {
+                  const res = await agent.post({
+                    $type: 'app.bsky.feed.post',
+                    text: chunk,
+                    reply: {
+                      root: { uri: rootRes.data.uri, cid: rootRes.data.cid },
+                      parent: { uri: parent.data.uri, cid: parent.data.cid },
+                    },
+                    createdAt: new Date().toISOString(),
+                  });
+                  console.log('Reply post:', res.data.uri);
+                  parent = res;
+                }
+              }
             } catch (e) {
               console.error('Bluesky post failed:', e?.message || e);
               process.exitCode = 0;
