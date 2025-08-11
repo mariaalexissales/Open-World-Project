@@ -1,0 +1,65 @@
+name: Post commit to Bluesky
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  bsky:
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip social]') }}
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Bluesky SDK
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install @atproto/api
+
+      - name: Post head commit to Bluesky
+        env:
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+        run: |
+          node - <<'NODE'
+          const { BskyAgent, RichText } = require('@atproto/api');
+          const evt = require(process.env.GITHUB_EVENT_PATH);
+          const repo = process.env.GITHUB_REPOSITORY;
+          const branch = process.env.GITHUB_REF_NAME;
+          const sha = process.env.GITHUB_SHA;
+          const short = (sha || '').slice(0,7);
+          const url = `https://github.com/${repo}/commit/${sha}`;
+          const head = evt.head_commit || {};
+          const author = (head.author && head.author.name) || process.env.GITHUB_ACTOR || 'Someone';
+          const msg = (head.message || '').replace(/\s+/g, ' ').trim();
+          let text = `${author} pushed to ${repo}@${branch} (${short}): ${msg}\n${url}`;
+          const rt = new RichText({ text });
+          const agent = new BskyAgent({ service: 'https://bsky.social' });
+          (async () => {
+            try {
+              await agent.login({
+                identifier: process.env.BSKY_HANDLE,
+                password: process.env.BSKY_APP_PASSWORD,
+              });
+              await rt.detectFacets(agent);
+              const MAX = 300;
+              if (rt.graphemeLength > MAX) {
+                const keepUrl = `\n${url}`;
+                const available = MAX - keepUrl.length - 1;
+                text = text.slice(0, Math.max(available, 0)) + '…' + keepUrl;
+              }
+              const res = await agent.post({
+                $type: 'app.bsky.feed.post',
+                text,
+                createdAt: new Date().toISOString(),
+              });
+              console.log('Bluesky post OK:', res.data.uri);
+            } catch (e) {
+              console.error('Bluesky post failed:', e?.message || e);
+              process.exitCode = 0;
+            }
+          })();
+          NODE
